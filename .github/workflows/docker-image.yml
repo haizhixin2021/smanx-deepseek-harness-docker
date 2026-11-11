@@ -80,7 +80,7 @@ concurrency:
 
 env:
   IMAGE_NAME: deepseek-harness
-  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'smanx/deepseek-harness' }}
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'haizhixin2021/deepseek-harness' }}
 
 jobs:
   # ── 1. 解析 .build-variants，动态生成变体矩阵 ──────────────────────────
