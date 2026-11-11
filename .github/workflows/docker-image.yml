@@ -48,7 +48,7 @@ on:
       platforms:
         description: "目标平台，逗号分隔（多平台会让 node-pty 走 QEMU 交叉编译，明显变慢）"
         required: false
-        default: "linux/amd64"
+        default: "linux/amd64,linux/arm64"
       push:
         description: "构建完成后是否推送镜像"
         type: boolean
