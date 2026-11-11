@@ -1,4 +1,5 @@
 
+
 name: Build & Push Docker Image
 
 # ─────────────────────────────────────────────────────────────────────
@@ -232,7 +233,7 @@ jobs:
 
       - name: Compose image tags (multi-platform)
         if: steps.mode.outputs.multi == 'true'
-        id: tags
+        id: tags-m
         run: |
           set -euo pipefail
           # Docker tag 规则：首字符须为字母或数字，其后允许 [._-]，长度 ≤ 128
@@ -265,7 +266,7 @@ jobs:
           platforms: ${{ env.PLATFORMS }}
           build-args: |
             DEV_TOOLS=${{ env.DEV_TOOLS }}
-          tags: ${{ steps.tags.outputs.tags }}
+          tags: ${{ steps.tags-m.outputs.tags }}
           push: ${{ env.ALLOW_PUSH == 'true' }}
           load: false
           provenance: false
@@ -311,7 +312,7 @@ jobs:
 
       - name: Compose image tags (single-platform)
         if: steps.mode.outputs.multi == 'false'
-        id: tags
+        id: tags-s
         run: |
           set -euo pipefail
           ok_tag() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; }
@@ -350,7 +351,7 @@ jobs:
         if: always()
         env:
           HUB_PUSHED: ${{ steps.mode.outputs.hub }}
-          PLANNED_TAGS: ${{ steps.tags.outputs.tags }}
+          PLANNED_TAGS: ${{ steps.tags-m.outputs.tags || steps.tags-s.outputs.tags }}
         run: |
           {
             echo "### 变体 \`${VARIANT_NAME}\`（DEV_TOOLS=\`${DEV_TOOLS}\`）"
