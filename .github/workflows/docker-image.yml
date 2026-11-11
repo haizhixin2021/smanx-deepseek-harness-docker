@@ -1,0 +1,307 @@
+name: Build & Push Docker Image
+
+# ─────────────────────────────────────────────────────────────────────
+# 自动编译并推送 deepseek-harness 镜像（GitHub Actions）
+#
+# 设计要点（与仓库现有约定对齐）：
+#   · 变体清单直接读仓库根目录 .build-variants：每行第一列 = tag 前缀 = DEV_TOOLS 构建参数，
+#     增删变体只改该文件，无需改动本 workflow。
+#   · 每个变体产出 2 个 tag × 2 个仓库 = 4 个 tag：
+#       基础镜像（DEV_TOOLS=none）: <repo>:latest            / <repo>:<版本号>
+#       工具变体（devtools 等）    : <repo>:<前缀>-latest     / <repo>:<前缀>-<版本号>
+#       仓库                       : GHCR（ghcr.io/<owner>/deepseek-harness）
+#                                    Docker Hub（默认 smanx/deepseek-harness）
+#   · 版本号 = 镜像内 /tmp/app_version.env 的 APP_VERSION（Dockerfile 生成，等于实际安装的
+#     @deepseek-ai/dsh 版本）；取不到时回退为构建日期 YYYYMMDD。
+#   · PR 只做构建验证不推送；push / workflow_dispatch / schedule 才推镜像。
+#
+# 需要在仓库 Settings → Secrets and variables → Actions 配置：
+#   Secrets   DOCKERHUB_USERNAME   Docker Hub 用户名
+#   Secrets   DOCKERHUB_TOKEN      Docker Hub 访问令牌（不配置则自动跳过 Docker Hub，只推 GHCR）
+#   Variables DOCKERHUB_REPO       可选，覆盖 Docker Hub 仓库名，默认 smanx/deepseek-harness
+#   GHCR 直接用内置 GITHUB_TOKEN 推送（已给 packages: write 权限），无需配置
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "Dockerfile"
+      - ".build-variants"
+      - "entrypoint.sh"
+      - "proxy/**"
+      - "manager/**"
+      - ".github/workflows/docker-build.yml"
+  pull_request:
+    paths:
+      - "Dockerfile"
+      - ".build-variants"
+      - "entrypoint.sh"
+      - "proxy/**"
+      - "manager/**"
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: "要构建的变体，逗号分隔（all = 全部；base = 不带开发工具的精简镜像）"
+        required: false
+        default: "all"
+      platforms:
+        description: "目标平台，逗号分隔（多平台会让 node-pty 走 QEMU 交叉编译，明显变慢）"
+        required: false
+        default: "linux/amd64"
+      push:
+        description: "构建完成后是否推送镜像"
+        type: boolean
+        required: false
+        default: true
+      no_cache:
+        description: "忽略构建缓存，强制全新构建"
+        type: boolean
+        required: false
+        default: false
+
+  # 镜像内安装的是 @deepseek-ai/dsh@next，会随上游更新而变旧；
+  # 如需定期重建保持新鲜，取消下面两行注释（定时任务会真实推送镜像）
+  # schedule:
+  #   - cron: "30 18 * * 1"   # 每周一 UTC 18:30 ≈ 北京时间周二 02:30
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: deepseek-harness
+  DOCKERHUB_REPO: ${{ vars.DOCKERHUB_REPO || 'smanx/deepseek-harness' }}
+
+jobs:
+  # ── 1. 解析 .build-variants，动态生成变体矩阵 ──────────────────────────
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.parse.outputs.matrix }}
+      owner: ${{ steps.names.outputs.owner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute lowercase image coordinates
+        id: names
+        run: |
+          # ghcr.io 的 owner/repo 必须全小写，否则推送报 invalid name
+          echo "owner=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Parse .build-variants into a build matrix
+        id: parse
+        env:
+          VARIANTS_INPUT: ${{ github.event.inputs.variants }}
+        run: |
+          python3 <<'PY' > /tmp/matrix.json
+          import json, os
+          # base = 不传开发工具（DEV_TOOLS=none），对应 README 里的 latest / <版本号>
+          rows = [{"prefix": "", "name": "base", "dev_tools": "none"}]
+          with open(".build-variants", encoding="utf-8") as f:
+              for line in f:
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  prefix = line.split("|", 1)[0].strip()
+                  if prefix and prefix.lower() != "none":
+                      rows.append({"prefix": prefix, "name": prefix, "dev_tools": prefix})
+          sel = (os.getenv("VARIANTS_INPUT") or "all").strip()
+          if sel and sel.lower() != "all":
+              want = {x.strip() for x in sel.split(",") if x.strip()}
+              rows = [r for r in rows if r["name"] in want or r["prefix"] in want]
+          if not rows:
+              raise SystemExit("没有匹配到任何变体：请检查 variants 输入是否与 .build-variants 一致")
+          print(json.dumps(rows))
+          PY
+          echo "解析出的变体矩阵："
+          cat /tmp/matrix.json
+          {
+            echo "matrix<<MATRIX_EOF"
+            cat /tmp/matrix.json
+            echo "MATRIX_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  # ── 2. 每个变体一个并行 job：构建 → 取版本号 → 打 tag → 推送 ────────────
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      GHCR_REPO: ghcr.io/${{ needs.prepare.outputs.owner }}/deepseek-harness
+      DEV_TOOLS: ${{ matrix.variant.dev_tools }}
+      TAG_PREFIX: ${{ matrix.variant.prefix == '' && '' || format('{0}-', matrix.variant.prefix) }}
+      PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64' }}
+      LOAD_TAG: localhost/dsh-build:${{ matrix.variant.name }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide build mode & push permission
+        id: mode
+        run: |
+          # 含逗号 = 多平台，必须走 buildx --push（无法 docker cp 取版本号）
+          if echo "$PLATFORMS" | grep -q ','; then
+            echo "multi=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "multi=false" >> "$GITHUB_OUTPUT"
+          fi
+          # PR 一律不推送；workflow_dispatch 可手动关闭推送
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "ALLOW_PUSH=false" >> "$GITHUB_ENV"
+          else
+            echo "ALLOW_PUSH=${{ github.event_name != 'workflow_dispatch' || github.event.inputs.push == 'true' }}" >> "$GITHUB_ENV"
+          fi
+          # 未配置 Docker Hub 令牌时自动降级为只推 GHCR，不让流水线红掉
+          if [ -n "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "hub=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hub=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::未配置 DOCKERHUB_TOKEN，本次只推送 GHCR"
+          fi
+
+      - name: Set up QEMU
+        if: steps.mode.outputs.multi == 'true'
+        uses: docker/setup-qemu-action@v3
+        with:
+          image: tonistiigi/binfmt:qemu-v8.1.5
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: env.ALLOW_PUSH == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: env.ALLOW_PUSH == 'true' && steps.mode.outputs.hub == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # ── 多平台分支：先向 npm 查 @deepseek-ai/dsh@next 版本，再 buildx 直推 ──
+      - name: Resolve version from npm (multi-platform)
+        if: steps.mode.outputs.multi == 'true'
+        run: |
+          VER="$(npm view @deepseek-ai/dsh dist-tags.next 2>/dev/null || true)"
+          if [ -z "$VER" ]; then
+            VER="$(date +%Y%m%d)"
+            echo "::warning::无法从 npm 取得 dsh 版本，回退为日期标签 ${VER}"
+          fi
+          echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
+
+      - name: Compose image tags (multi-platform)
+        if: steps.mode.outputs.multi == 'true'
+        id: tags
+        run: |
+          {
+            echo "tags<<TAGS_EOF"
+            echo "${GHCR_REPO}:${TAG_PREFIX}${APP_VERSION}"
+            echo "${GHCR_REPO}:${TAG_PREFIX}latest"
+            if [ "${{ steps.mode.outputs.hub }}" = "true" ]; then
+              echo "${DOCKERHUB_REPO}:${TAG_PREFIX}${APP_VERSION}"
+              echo "${DOCKERHUB_REPO}:${TAG_PREFIX}latest"
+            fi
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build & push (multi-platform)
+        if: steps.mode.outputs.multi == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            DEV_TOOLS=${{ env.DEV_TOOLS }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: ${{ env.ALLOW_PUSH == 'true' }}
+          load: false
+          provenance: false
+          no-cache: ${{ github.event.inputs.no_cache == 'true' }}
+          cache-from: type=gha,scope=dsh-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=dsh-${{ matrix.variant.name }}
+
+      # ── 单平台分支（默认）：--load 到本地，再用镜像内真实版本号打 tag ──
+      - name: Build image (single platform, load into docker)
+        if: steps.mode.outputs.multi == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          build-args: |
+            DEV_TOOLS=${{ env.DEV_TOOLS }}
+          tags: ${{ env.LOAD_TAG }}
+          load: true
+          push: false
+          no-cache: ${{ github.event.inputs.no_cache == 'true' }}
+          cache-from: type=gha,scope=dsh-${{ matrix.variant.name }}
+          cache-to: type=gha,mode=max,scope=dsh-${{ matrix.variant.name }}
+
+      - name: Extract APP_VERSION from the built image
+        if: steps.mode.outputs.multi == 'false'
+        run: |
+          set -euo pipefail
+          rm -f /tmp/app_version.env
+          cid="$(docker create --entrypoint /bin/true "$LOAD_TAG")"
+          docker cp "$cid:/tmp/app_version.env" /tmp/app_version.env || true
+          docker rm -f "$cid" > /dev/null
+          VER=""
+          if [ -f /tmp/app_version.env ]; then
+            VER="$(sed -n 's/^APP_VERSION=//p' /tmp/app_version.env | tail -n1 | tr -d '[:space:]')"
+          fi
+          if [ -z "$VER" ]; then
+            VER="$(date +%Y%m%d)"
+            echo "::warning::镜像内未找到 APP_VERSION，回退为日期标签 ${VER}"
+          fi
+          echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
+          echo "本次构建对应的 DSH 版本：${VER}"
+
+      - name: Tag & push to GHCR + Docker Hub
+        if: steps.mode.outputs.multi == 'false' && env.ALLOW_PUSH == 'true'
+        env:
+          PUSH_HUB: ${{ steps.mode.outputs.hub }}
+        run: |
+          set -euo pipefail
+          for repo in "$GHCR_REPO" "$DOCKERHUB_REPO"; do
+            if [ "$repo" = "$DOCKERHUB_REPO" ] && [ "$PUSH_HUB" != "true" ]; then
+              continue
+            fi
+            for suffix in "${TAG_PREFIX}${APP_VERSION}" "${TAG_PREFIX}latest"; do
+              target="${repo}:${suffix}"
+              docker tag "$LOAD_TAG" "$target"
+              docker push "$target"
+              echo "已推送 ${target}"
+            done
+          done
+
+      - name: Summary
+        if: always()
+        env:
+          HUB_PUSHED: ${{ steps.mode.outputs.hub }}
+        run: |
+          {
+            echo "### 变体 \`${{ matrix.variant.name }}\`（DEV_TOOLS=\`${DEV_TOOLS}\`）"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| 平台 | \`${PLATFORMS}\` |"
+            echo "| DSH 版本 | \`${APP_VERSION:-未解析}\` |"
+            echo "| Tag | \`${TAG_PREFIX}${APP_VERSION:-?}\` / \`${TAG_PREFIX}latest\` |"
+            echo "| 推送 GHCR | ${{ env.ALLOW_PUSH }} |"
+            echo "| 推送 Docker Hub | ${HUB_PUSHED} |"
+          } >> "$GITHUB_STEP_SUMMARY"
