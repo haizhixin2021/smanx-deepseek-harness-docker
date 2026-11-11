@@ -1,3 +1,4 @@
+
 name: Build & Push Docker Image
 
 # ─────────────────────────────────────────────────────────────────────
@@ -7,12 +8,15 @@ name: Build & Push Docker Image
 #   · 变体清单直接读仓库根目录 .build-variants：每行第一列 = tag 前缀 = DEV_TOOLS 构建参数，
 #     增删变体只改该文件，无需改动本 workflow。
 #   · 每个变体产出 2 个 tag × 2 个仓库 = 4 个 tag：
-#       基础镜像（DEV_TOOLS=none）: <repo>:latest            / <repo>:<版本号>
-#       工具变体（devtools 等）    : <repo>:<前缀>-latest     / <repo>:<前缀>-<版本号>
+#       基础镜像（DEV_TOOLS=none）: <repo>:latest          / <repo>:<版本号>
+#       工具变体（devtools 等）    : <repo>:<前缀>-latest   / <repo>:<前缀>-<版本号>
 #       仓库                       : GHCR（ghcr.io/<owner>/deepseek-harness）
 #                                    Docker Hub（默认 smanx/deepseek-harness）
 #   · 版本号 = 镜像内 /tmp/app_version.env 的 APP_VERSION（Dockerfile 生成，等于实际安装的
 #     @deepseek-ai/dsh 版本）；取不到时回退为构建日期 YYYYMMDD。
+#   · tag 全部在 shell 里拼装，并在 buildx / docker push 之前校验一次；非法 tag 会以
+#     ::error:: 明确报出「前缀 = ? 版本 = ?」，不会再出现 buildx 抛
+#     invalid reference format 却看不出原因的情况。
 #   · PR 只做构建验证不推送；push / workflow_dispatch / schedule 才推镜像。
 #
 # 需要在仓库 Settings → Secrets and variables → Actions 配置：
@@ -48,7 +52,7 @@ on:
       platforms:
         description: "目标平台，逗号分隔（多平台会让 node-pty 走 QEMU 交叉编译，明显变慢）"
         required: false
-        default: "linux/amd64,linux/arm64"
+        default: "linux/amd64"
       push:
         description: "构建完成后是否推送镜像"
         type: boolean
@@ -100,7 +104,10 @@ jobs:
           VARIANTS_INPUT: ${{ github.event.inputs.variants }}
         run: |
           python3 <<'PY' > /tmp/matrix.json
-          import json, os
+          import json, os, re
+          def safe(s):
+              # 前缀同时用作 tag 前缀 / 缓存 scope / 本地 tag 名，先做一次字符白名单清洗
+              return re.sub(r"[^A-Za-z0-9._-]", "-", str(s)).strip("-._")
           # base = 不传开发工具（DEV_TOOLS=none），对应 README 里的 latest / <版本号>
           rows = [{"prefix": "", "name": "base", "dev_tools": "none"}]
           with open(".build-variants", encoding="utf-8") as f:
@@ -108,7 +115,7 @@ jobs:
                   line = line.strip()
                   if not line or line.startswith("#"):
                       continue
-                  prefix = line.split("|", 1)[0].strip()
+                  prefix = safe(line.split("|", 1)[0].strip())
                   if prefix and prefix.lower() != "none":
                       rows.append({"prefix": prefix, "name": prefix, "dev_tools": prefix})
           sel = (os.getenv("VARIANTS_INPUT") or "all").strip()
@@ -127,7 +134,7 @@ jobs:
             echo "MATRIX_EOF"
           } >> "$GITHUB_OUTPUT"
 
-  # ── 2. 每个变体一个并行 job：构建 → 取版本号 → 打 tag → 推送 ────────────
+  # ── 2. 每个变体一个并行 job：构建 → 取版本号 → 拼 tag → 推送 ────────────
   build:
     needs: prepare
     runs-on: ubuntu-latest
@@ -138,9 +145,14 @@ jobs:
     env:
       GHCR_REPO: ghcr.io/${{ needs.prepare.outputs.owner }}/deepseek-harness
       DEV_TOOLS: ${{ matrix.variant.dev_tools }}
-      TAG_PREFIX: ${{ matrix.variant.prefix == '' && '' || format('{0}-', matrix.variant.prefix) }}
+      VARIANT_NAME: ${{ matrix.variant.name }}
+      # 这里只把「原始前缀」作为变量传下来，tag 前缀由下面 tag-prefix 步骤用 shell 计算。
+      # 不要改回 ${{ }} 三元写法（matrix.variant.prefix == '' && '' || format('{0}-', ...)）：
+      # Actions 表达式把空字符串判为 falsy，base 变体会落进 format 分支拿到 "-"，
+      # 于是拼出 ghcr.io/<owner>/deepseek-harness:-latest 这种 invalid reference format。
+      VARIANT_PREFIX: ${{ matrix.variant.prefix }}
       PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64' }}
-      LOAD_TAG: localhost/dsh-build:${{ matrix.variant.name }}
+      LOAD_TAG: dsh-build-local-${{ matrix.variant.name }}:scratch
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -148,6 +160,7 @@ jobs:
       - name: Decide build mode & push permission
         id: mode
         run: |
+          set -euo pipefail
           # 含逗号 = 多平台，必须走 buildx --push（无法 docker cp 取版本号）
           if echo "$PLATFORMS" | grep -q ','; then
             echo "multi=true" >> "$GITHUB_OUTPUT"
@@ -167,6 +180,16 @@ jobs:
             echo "hub=false" >> "$GITHUB_OUTPUT"
             echo "::notice::未配置 DOCKERHUB_TOKEN，本次只推送 GHCR"
           fi
+
+      # ── tag 前缀：base（前缀为空）不加连字符；其余变体加一个连字符 ────────
+      - name: Compute tag prefix
+        id: prefix
+        run: |
+          set -euo pipefail
+          raw="$(printf '%s' "$VARIANT_PREFIX" | tr -d '[:space:]' | sed -E 's/^[._-]+//; s/[._-]+$//')"
+          if [ -n "$raw" ]; then tp="${raw}-"; else tp=""; fi
+          echo "TAG_PREFIX=$tp" >> "$GITHUB_ENV"
+          echo "变体 ${VARIANT_NAME} 的 tag 前缀 = [${tp}]（base 应为空）"
 
       - name: Set up QEMU
         if: steps.mode.outputs.multi == 'true'
@@ -198,7 +221,9 @@ jobs:
       - name: Resolve version from npm (multi-platform)
         if: steps.mode.outputs.multi == 'true'
         run: |
+          set -euo pipefail
           VER="$(npm view @deepseek-ai/dsh dist-tags.next 2>/dev/null || true)"
+          VER="$(printf '%s' "$VER" | tr -d '[:space:]' | sed -E 's/^[._-]+//; s/[._-]+$//')"
           if [ -z "$VER" ]; then
             VER="$(date +%Y%m%d)"
             echo "::warning::无法从 npm 取得 dsh 版本，回退为日期标签 ${VER}"
@@ -209,14 +234,26 @@ jobs:
         if: steps.mode.outputs.multi == 'true'
         id: tags
         run: |
+          set -euo pipefail
+          # Docker tag 规则：首字符须为字母或数字，其后允许 [._-]，长度 ≤ 128
+          ok_tag() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; }
+          : > /tmp/tags.txt
+          for repo in "$GHCR_REPO" "$DOCKERHUB_REPO"; do
+            if [ "$repo" = "$DOCKERHUB_REPO" ] && [ "${{ steps.mode.outputs.hub }}" != "true" ]; then
+              continue
+            fi
+            for suffix in "${TAG_PREFIX}${APP_VERSION}" "${TAG_PREFIX}latest"; do
+              if ! ok_tag "$suffix"; then
+                echo "::error::非法镜像 tag：${repo}:${suffix}（TAG_PREFIX=[${TAG_PREFIX}] APP_VERSION=[${APP_VERSION}]，变体=${VARIANT_NAME}）"
+                exit 1
+              fi
+              echo "${repo}:${suffix}" >> /tmp/tags.txt
+            done
+          done
+          cat /tmp/tags.txt
           {
             echo "tags<<TAGS_EOF"
-            echo "${GHCR_REPO}:${TAG_PREFIX}${APP_VERSION}"
-            echo "${GHCR_REPO}:${TAG_PREFIX}latest"
-            if [ "${{ steps.mode.outputs.hub }}" = "true" ]; then
-              echo "${DOCKERHUB_REPO}:${TAG_PREFIX}${APP_VERSION}"
-              echo "${DOCKERHUB_REPO}:${TAG_PREFIX}latest"
-            fi
+            cat /tmp/tags.txt
             echo "TAGS_EOF"
           } >> "$GITHUB_OUTPUT"
 
@@ -233,8 +270,8 @@ jobs:
           load: false
           provenance: false
           no-cache: ${{ github.event.inputs.no_cache == 'true' }}
-          cache-from: type=gha,scope=dsh-${{ matrix.variant.name }}
-          cache-to: type=gha,mode=max,scope=dsh-${{ matrix.variant.name }}
+          cache-from: type=gha,scope=dsh-${{ env.VARIANT_NAME }}
+          cache-to: type=gha,mode=max,scope=dsh-${{ env.VARIANT_NAME }}
 
       # ── 单平台分支（默认）：--load 到本地，再用镜像内真实版本号打 tag ──
       - name: Build image (single platform, load into docker)
@@ -249,8 +286,8 @@ jobs:
           load: true
           push: false
           no-cache: ${{ github.event.inputs.no_cache == 'true' }}
-          cache-from: type=gha,scope=dsh-${{ matrix.variant.name }}
-          cache-to: type=gha,mode=max,scope=dsh-${{ matrix.variant.name }}
+          cache-from: type=gha,scope=dsh-${{ env.VARIANT_NAME }}
+          cache-to: type=gha,mode=max,scope=dsh-${{ env.VARIANT_NAME }}
 
       - name: Extract APP_VERSION from the built image
         if: steps.mode.outputs.multi == 'false'
@@ -264,6 +301,7 @@ jobs:
           if [ -f /tmp/app_version.env ]; then
             VER="$(sed -n 's/^APP_VERSION=//p' /tmp/app_version.env | tail -n1 | tr -d '[:space:]')"
           fi
+          VER="$(printf '%s' "$VER" | sed -E 's/^[._-]+//; s/[._-]+$//')"
           if [ -z "$VER" ]; then
             VER="$(date +%Y%m%d)"
             echo "::warning::镜像内未找到 APP_VERSION，回退为日期标签 ${VER}"
@@ -271,37 +309,63 @@ jobs:
           echo "APP_VERSION=$VER" >> "$GITHUB_ENV"
           echo "本次构建对应的 DSH 版本：${VER}"
 
-      - name: Tag & push to GHCR + Docker Hub
-        if: steps.mode.outputs.multi == 'false' && env.ALLOW_PUSH == 'true'
-        env:
-          PUSH_HUB: ${{ steps.mode.outputs.hub }}
+      - name: Compose image tags (single-platform)
+        if: steps.mode.outputs.multi == 'false'
+        id: tags
         run: |
           set -euo pipefail
+          ok_tag() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$'; }
+          : > /tmp/tags.txt
           for repo in "$GHCR_REPO" "$DOCKERHUB_REPO"; do
-            if [ "$repo" = "$DOCKERHUB_REPO" ] && [ "$PUSH_HUB" != "true" ]; then
+            if [ "$repo" = "$DOCKERHUB_REPO" ] && [ "${{ steps.mode.outputs.hub }}" != "true" ]; then
               continue
             fi
             for suffix in "${TAG_PREFIX}${APP_VERSION}" "${TAG_PREFIX}latest"; do
-              target="${repo}:${suffix}"
-              docker tag "$LOAD_TAG" "$target"
-              docker push "$target"
-              echo "已推送 ${target}"
+              if ! ok_tag "$suffix"; then
+                echo "::error::非法镜像 tag：${repo}:${suffix}（TAG_PREFIX=[${TAG_PREFIX}] APP_VERSION=[${APP_VERSION}]，变体=${VARIANT_NAME}）"
+                exit 1
+              fi
+              echo "${repo}:${suffix}" >> /tmp/tags.txt
             done
           done
+          cat /tmp/tags.txt
+          {
+            echo "tags<<TAGS_EOF"
+            cat /tmp/tags.txt
+            echo "TAGS_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Tag & push to GHCR + Docker Hub
+        if: steps.mode.outputs.multi == 'false' && env.ALLOW_PUSH == 'true'
+        run: |
+          set -euo pipefail
+          while IFS= read -r target; do
+            [ -n "$target" ] || continue
+            docker tag "$LOAD_TAG" "$target"
+            docker push "$target"
+            echo "已推送 ${target}"
+          done < /tmp/tags.txt
 
       - name: Summary
         if: always()
         env:
           HUB_PUSHED: ${{ steps.mode.outputs.hub }}
+          PLANNED_TAGS: ${{ steps.tags.outputs.tags }}
         run: |
           {
-            echo "### 变体 \`${{ matrix.variant.name }}\`（DEV_TOOLS=\`${DEV_TOOLS}\`）"
+            echo "### 变体 \`${VARIANT_NAME}\`（DEV_TOOLS=\`${DEV_TOOLS}\`）"
             echo ""
             echo "| 项 | 值 |"
             echo "| --- | --- |"
             echo "| 平台 | \`${PLATFORMS}\` |"
             echo "| DSH 版本 | \`${APP_VERSION:-未解析}\` |"
-            echo "| Tag | \`${TAG_PREFIX}${APP_VERSION:-?}\` / \`${TAG_PREFIX}latest\` |"
+            echo "| tag 前缀 | [${TAG_PREFIX}]（base 为空） |"
             echo "| 推送 GHCR | ${{ env.ALLOW_PUSH }} |"
             echo "| 推送 Docker Hub | ${HUB_PUSHED} |"
+            echo ""
+            echo "本次生成的镜像 tag："
+            echo ""
+            echo '```text'
+            echo "${PLANNED_TAGS:-（未生成）}"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
