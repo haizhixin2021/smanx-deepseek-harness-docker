@@ -18,9 +18,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/* \
     && if [ "$DEV_TOOLS" = "admin" ]; then \
-         npm install -g --prefix /opt/dsh --no-audit --no-fund @deepseek-ai/dsh@next; \
+         npm install -g --prefix /opt/dsh --no-audit --no-fund @deepseek-ai/dsh@alpha; \
        else \
-         npm install -g --no-audit --no-fund @deepseek-ai/dsh@next; \
+         npm install -g --no-audit --no-fund @deepseek-ai/dsh@alpha; \
        fi \
     && mkdir -p /opt/dsh
 
